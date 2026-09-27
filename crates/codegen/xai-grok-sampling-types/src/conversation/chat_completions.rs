@@ -1,3 +1,5 @@
+//! Chat Completions wire format.
+
 use super::*;
 
 impl From<ChatRequestMessage> for ConversationItem {
@@ -5,7 +7,6 @@ impl From<ChatRequestMessage> for ConversationItem {
         match msg.role {
             Role::System => ConversationItem::System(SystemItem {
                 content: Arc::<str>::from(msg.text_content()),
-                synthetic_reason: SyntheticReason::Primary,
             }),
             Role::User => {
                 let parts = msg
@@ -23,14 +24,13 @@ impl From<ChatRequestMessage> for ConversationItem {
                     .collect();
                 ConversationItem::User(UserItem {
                     content: parts,
-                    synthetic_reason: SyntheticReason::Human,
-                    cwd_generation: None,
-                    prior_turn_interrupt: None,
-                    prompt_index: None,
+                    synthetic_reason: None,
+                    ..Default::default()
                 })
             }
             Role::Assistant => {
-                // Reasoning is a sibling item, which a single-item conversion cannot emit, so it is dropped here
+                // Reasoning is a sibling item, which a single-item conversion
+                // cannot emit, so it is dropped here.
                 let content = msg.text_content();
                 let model_id = msg.model_id;
 
@@ -64,9 +64,10 @@ impl From<ChatRequestMessage> for ConversationItem {
     }
 }
 
-/// Convert a single non-`Reasoning` [`ConversationItem`].
-/// The wire format carries `reasoning_content` on the *following* assistant message, which a single item cannot see.
-/// Use [`conversation_to_chat_messages`] instead when reasoning must survive.
+/// Convert a single non-`Reasoning` [`ConversationItem`]. The wire format
+/// carries `reasoning_content` on the *following* assistant message, which a
+/// single item cannot see, so use [`conversation_to_chat_messages`] instead
+/// when reasoning must survive.
 pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestMessage {
     match item {
         ConversationItem::System(s) => ChatRequestMessage::system(s.content.as_ref()),
@@ -75,7 +76,8 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
                 .content
                 .iter()
                 .any(|p| matches!(p, ContentPart::Image { .. }));
-            // Collapse to a single text block when there are no images, matching the behavior from before content blocks existed
+            // Collapse to a single text block when there are no images, as
+            // the pre-blocks behavior did.
             let content = if !has_images {
                 let text = u
                     .content
@@ -136,34 +138,16 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
             }
         }
         ConversationItem::ToolResult(t) => {
-            if t.images.is_empty() {
-                ChatRequestMessage::tool(t.tool_call_id, t.content.as_ref().to_owned())
-            } else {
-                let mut blocks = vec![ChatContentBlock::Text {
-                    text: t.content.as_ref().to_owned(),
-                }];
-                for img in t.images {
-                    if let ContentPart::Image { url } = img {
-                        blocks.push(ChatContentBlock::ImageUrl {
-                            image_url: ImageUrl {
-                                url: url.as_ref().to_owned(),
-                            },
-                        });
-                    }
-                }
-                ChatRequestMessage {
-                    role: Role::Tool,
-                    content: MessageContent::Blocks(blocks),
-                    name: None,
-                    tool_calls: Vec::new(),
-                    tool_call_id: Some(t.tool_call_id),
-                    model_id: None,
-                    reasoning_content: None,
-                }
-            }
+            // `role: "tool"` `content` is typed as a string by OpenAI-compatible
+            // validators (Pydantic: "Input should be a valid string"). Image
+            // blocks here 422 the whole turn on those hosts. Images attached to
+            // the tool result ride a follow-up user message emitted by
+            // [`conversation_to_chat_messages`].
+            ChatRequestMessage::tool(t.tool_call_id, t.content.as_ref().to_owned())
         }
         // Backend tool calls have no Chat Completions equivalent.
-        // Emit a synthetic assistant message so the model sees context about what was searched, without breaking the message sequence
+        // Emit a synthetic assistant message so the model sees context
+        // about what was searched, without breaking the message sequence.
         ConversationItem::BackendToolCall(b) => ChatRequestMessage {
             role: Role::Assistant,
             content: MessageContent::Text(b.text_summary()),
@@ -181,11 +165,37 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
     }
 }
 
-/// The canonical conversion: each run of `Reasoning` siblings folds into the `reasoning_content` of the following `Assistant`.
-/// A `BackendToolCall` in between does not break the fold, any other item clears it, and reasoning with no following assistant is dropped.
+/// The canonical conversion. Each run of `Reasoning` siblings folds into the
+/// `reasoning_content` of the following `Assistant`; a `BackendToolCall` in
+/// between does not break the fold, any other item clears it, and reasoning
+/// with no following assistant is dropped.
+///
+/// Tool-result images cannot ride `role: "tool"` (OpenAI-compatible validators
+/// require string `content`). They are collected across consecutive tool
+/// results and re-emitted as one follow-up user message after the tool-result
+/// block, so all tool messages stay contiguous under the assistant
+/// `tool_calls` they answer.
 pub fn conversation_to_chat_messages(items: Vec<ConversationItem>) -> Vec<ChatRequestMessage> {
-    let mut out: Vec<ChatRequestMessage> = Vec::with_capacity(items.len());
+    let mut out: Vec<ChatRequestMessage> = Vec::with_capacity(items.len() + 1);
     let mut pending_reasoning: Vec<String> = Vec::new();
+    let mut pending_tool_images: Vec<ContentPart> = Vec::new();
+
+    fn flush_tool_images(out: &mut Vec<ChatRequestMessage>, images: &mut Vec<ContentPart>) {
+        if images.is_empty() {
+            return;
+        }
+        let mut content = vec![ContentPart::Text {
+            text: Arc::<str>::from("Images from the preceding tool results:"),
+        }];
+        content.append(images);
+        out.push(conversation_item_to_chat_message(ConversationItem::User(UserItem {
+            content,
+            // Not a user prompt: recaps, turn summaries, and prompt suggest
+            // filter `synthetic_reason.is_some()` out of "real" queries.
+            synthetic_reason: Some(SyntheticReason::SystemReminder),
+            ..Default::default()
+        })));
+    }
 
     for item in items {
         match item {
@@ -196,6 +206,7 @@ pub fn conversation_to_chat_messages(items: Vec<ConversationItem>) -> Vec<ChatRe
                 }
             }
             ConversationItem::Assistant(_) => {
+                flush_tool_images(&mut out, &mut pending_tool_images);
                 let mut msg = conversation_item_to_chat_message(item);
                 if !pending_reasoning.is_empty() {
                     msg.reasoning_content = Some(pending_reasoning.join("\n"));
@@ -204,22 +215,41 @@ pub fn conversation_to_chat_messages(items: Vec<ConversationItem>) -> Vec<ChatRe
                 out.push(msg);
             }
             ConversationItem::BackendToolCall(_) => {
-                // Keep `pending_reasoning` so it still folds onto the following assistant, as the Responses path does
+                // Keep `pending_reasoning` so it still folds onto the
+                // following assistant, as the Responses path does.
+                flush_tool_images(&mut out, &mut pending_tool_images);
                 out.push(conversation_item_to_chat_message(item));
             }
+            ConversationItem::ToolResult(t) => {
+                pending_reasoning.clear();
+                pending_tool_images.extend(t.images.iter().filter_map(|p| match p {
+                    ContentPart::Image { .. } => Some(p.clone()),
+                    _ => None,
+                }));
+                out.push(conversation_item_to_chat_message(ConversationItem::ToolResult(
+                    ToolResultItem {
+                        tool_call_id: t.tool_call_id,
+                        content: t.content,
+                        images: Vec::new(),
+                    },
+                )));
+            }
             other => {
+                flush_tool_images(&mut out, &mut pending_tool_images);
                 pending_reasoning.clear();
                 out.push(conversation_item_to_chat_message(other));
             }
         }
     }
+    flush_tool_images(&mut out, &mut pending_tool_images);
 
     out
 }
 
 impl From<ChatResponseMessage> for ConversationItem {
     fn from(msg: ChatResponseMessage) -> Self {
-        // Reasoning is dropped: the streaming consumer synthesizes the sibling item instead
+        // Reasoning is dropped: the streaming consumer synthesizes the
+        // sibling item instead.
         let content = msg.content.unwrap_or_default();
 
         let tool_calls: Vec<ToolCall> = msg
@@ -298,12 +328,10 @@ impl From<ConversationRequest> for ChatCompletionRequest {
             x_grok_req_id: req.x_grok_req_id,
             x_grok_session_id: req.x_grok_session_id,
             x_grok_turn_idx: req.x_grok_turn_idx,
-            x_grok_transient_retry: req.x_grok_transient_retry,
             x_grok_agent_id: req.x_grok_agent_id,
             x_grok_deployment_id: req.x_grok_deployment_id,
             x_grok_user_id: req.x_grok_user_id,
             trace: None,
-            traceparent: req.traceparent,
         }
     }
 }
