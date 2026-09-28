@@ -103,99 +103,119 @@ pub enum ConversationItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemItem {
     pub content: Arc<str>,
+    /// `Primary` is omitted on write and filled in when absent, so the leading prompt serializes as it did before this field existed.
+    #[serde(
+        default = "SyntheticReason::primary",
+        skip_serializing_if = "SyntheticReason::is_primary"
+    )]
+    pub synthetic_reason: SyntheticReason,
 }
 
-/// Reason why a `UserItem` was synthesized by the runtime rather than typed
-/// by a real user.  Stored alongside the item so downstream code (pruning,
-/// replay, analytics) can distinguish synthetic injections from real input
-/// without parsing message text.
-///
-/// Serialized as a lowercase string (e.g. `"auto_continue"`).
-/// Unknown variants (from future clients or removed historical tags such as
-/// `"doom_loop_warning"`) deserialize as [`SyntheticReason::Unknown`]
-/// so old clients can still read sessions written by newer versions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Origin of a `UserItem` or `SystemItem`: typed by the user, the request's system prompt, or synthesized by the runtime for one of the listed reasons.
+/// Stored so downstream code (pruning, replay, analytics) can tell synthetic injections from real input without parsing message text.
+/// The two non-synthetic origins ([`Self::Human`], [`Self::Primary`]) live here so the field is never optional; each item type defaults to its own when the field is absent.
+/// The wire field name stays `synthetic_reason` so old clients keep reading new sessions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyntheticReason {
-    /// Metadata injected by the compaction pipeline (e.g., re-read file
-    /// contents). Not real user input.
+    /// Typed by the user.
+    #[default]
+    Human,
+    /// The system prompt that opens the conversation, ahead of every other item.
+    Primary,
+    /// Metadata injected by the compaction pipeline (e.g., re-read file contents).
     CompactionMeta,
-    /// Runtime-injected `<system-reminder>` message. Not real user input.
+    /// Runtime-injected `<system-reminder>` message.
     SystemReminder,
-    /// Project-level instruction message (AGENTS.md / CLAUDE.md) injected at
-    /// session spawn. Invariant: once placed, never replaced (would bust the
-    /// KV-cache prefix).
+    /// Continue reminder after a salvaged Length truncation.
+    /// Distinct from [`Self::SystemReminder`] so report assembly joins segments around exactly this reminder and no other.
+    LengthContinue,
+    /// Project-level instruction message (AGENTS.md / CLAUDE.md) injected at session spawn.
+    /// Invariant: once placed, never replaced (replacing it would bust the KV-cache prefix).
     ProjectInstructions,
-    /// Injected by the auto-continue logic after compaction so the agent
-    /// keeps working.  Not real user input.
+    /// Injected by the auto-continue logic after compaction so the agent keeps working.
     AutoContinue,
-    /// Injected by the auto-recovery logic after a transient tool failure
-    /// to retry the operation.  Not real user input.
+    /// Injected by the auto-recovery logic after a transient tool failure to retry the operation.
     AutoRecovery,
-    /// User-initiated mid-turn interjection sent via Ctrl+Enter while the
-    /// model was actively running.  Injected between tool batches so the
-    /// model sees it as steering context without canceling the turn.
+    /// User-initiated mid-turn interjection sent via Ctrl+Enter while the model was actively running.
+    /// Injected between tool batches so the model sees it as steering context without canceling the turn.
     Interjection,
     /// Model-authored input sent by another agent.
     #[serde(alias = "parent_agent_message")]
     AgentMessage,
-    /// Auto-wake synthetic prompt injected when a background bash task
-    /// completed.  Wakes the agent for a new turn.
+    /// Auto-wake synthetic prompt injected when a background bash task completed.
+    /// Wakes the agent for a new turn.
     TaskCompleted,
-    /// Auto-wake synthetic prompt injected when a background subagent
-    /// completed.  Wakes the agent for a new turn.
+    /// Auto-wake synthetic prompt injected when a background subagent completed.
+    /// Wakes the agent for a new turn.
     SubagentCompleted,
-    /// Idle-gated notification drain: batched monitor events and/or bash
-    /// task completions drained when the session is idle.  Wakes the agent.
+    /// Idle-gated notification drain: batched monitor events and/or bash task completions drained when the session is idle.
+    /// Wakes the agent.
     NotificationDrain,
-    /// Goal orchestrator summary turn.  The goal system triggers a model
-    /// turn so it can print visible progress.  Wakes the agent.
+    /// Goal orchestrator summary turn.
+    /// The goal system triggers a model turn so it can print visible progress.
+    /// Wakes the agent.
     GoalSummary,
-    /// Goal-achievement classifier nudge injected after the classifier
-    /// rejects an `update_goal(completed: true)` attempt. Wakes the
-    /// agent with a "not yet achieved — keep working" reminder pointing
-    /// at the persisted details file.
+    /// Goal-achievement classifier nudge injected when the classifier rejects an `update_goal(completed: true)` attempt.
+    /// Wakes the agent with a "not yet achieved — keep working" reminder pointing at the persisted details file.
     GoalClassifierNudge,
-    /// Scheduled task (`/loop`) prompt fired by the scheduler.  Wakes the
-    /// agent.
+    /// Scheduled task (`/loop`) prompt fired by the scheduler.
+    /// Wakes the agent.
     SchedulerFired,
-    /// Feedback from a `Stop`/`SubagentStop` hook that blocked the agent from
-    /// stopping. Injected in-turn so the model keeps working within the same turn.
+    /// Feedback from a `Stop`/`SubagentStop` hook that blocked the agent from stopping.
+    /// Injected in-turn so the model keeps working within the same turn.
     StopHookFeedback,
     /// Working-directory switch context appended after a session relocation.
     /// Carries a generation marker so recovery can detect an existing append.
     WorkingDirectorySwitch,
-    /// Catch-all for unknown/future variants.  Preserves forward compatibility
-    /// so older clients can deserialize sessions written by newer versions.
+    /// Human-authored text relayed from a parent session. Stays a `User` item.
+    ParentHumanMessage,
+    /// The startup `<user_info>` / rules / VCS-status prefix inserted after the primary prompt.
+    SessionPrefix,
+    /// The direct-bash (`!cmd`) command-and-output history message.
+    DirectBash,
+    /// The goal rules and tracking policy that accompany a `/goal` objective.
+    GoalSetup,
+    /// Catch-all for unknown/future variants.
     #[serde(other)]
     Unknown,
 }
 
 impl SyntheticReason {
-    /// Whether a user item with this reason **starts a prompt turn** — i.e.
-    /// the turn pipeline pushed it while consuming a `prompt_index` slot
-    /// (auto-wake and other server-initiated turns), as opposed to a
-    /// mid-turn injection that never incremented the index.
-    ///
-    /// Used by [`conversation_truncate_for_prompt`]'s counting fallback for
-    /// items persisted before [`UserItem::prompt_index`] existed. Exhaustive
-    /// match — adding a variant forces an explicit decision here.
-    ///
-    /// `GoalSummary` is deliberately `false`: the same reason tags both the
-    /// legacy goal-continuation *turn* (index-consuming) and the in-turn goal
-    /// directive (mid-turn). Unknown future reasons fail safe as boundaries so
-    /// older readers cannot merge a newer conversational origin into a prior turn.
+    /// Serde default for `SystemItem.synthetic_reason`; `#[serde(default = "...")]` takes a function path, not a variant.
+    pub fn primary() -> Self {
+        Self::Primary
+    }
+
+    pub fn is_human(&self) -> bool {
+        *self == Self::Human
+    }
+
+    pub fn is_primary(&self) -> bool {
+        *self == Self::Primary
+    }
+
+    /// Whether an item with this reason **starts a prompt turn**, meaning the turn pipeline pushed it while consuming a `prompt_index` slot.
+    /// That covers real prompts, auto-wake and other server-initiated turns, as opposed to a mid-turn injection that never incremented the index.
+    /// Unknown future reasons fail safe as boundaries so older readers cannot merge a newer conversational origin into a prior turn.
     pub fn starts_prompt_turn(&self) -> bool {
         match self {
-            Self::AgentMessage
+            Self::Human
+            | Self::AgentMessage
+            | Self::ParentHumanMessage
+            | Self::DirectBash
+            | Self::GoalSetup
             | Self::Unknown
             | Self::TaskCompleted
             | Self::SubagentCompleted
             | Self::NotificationDrain
             | Self::GoalClassifierNudge
             | Self::SchedulerFired => true,
-            Self::CompactionMeta
+            Self::Primary
+            | Self::SessionPrefix
+            | Self::CompactionMeta
             | Self::SystemReminder
+            | Self::LengthContinue
             | Self::ProjectInstructions
             | Self::AutoContinue
             | Self::AutoRecovery
@@ -207,27 +227,13 @@ impl SyntheticReason {
     }
 }
 
-/// How the user *fatally* interrupted (cancelled) the turn immediately
-/// preceding this *real* user message. Set only on genuine user messages
-/// (`synthetic_reason == None`) that directly follow a cancelled turn, so
-/// downstream code (replay, analytics, the model itself) can see that the user
-/// redirected after stopping work — without parsing message text.
-///
-/// Reserved for the *fatal* user-interrupt causes that end the turn:
-/// `mid_turn_abort` (ESC / Ctrl+C), `permission_rejected`, `permission_cancelled`.
-/// A mid-turn *interjection* is deliberately NOT represented here — it does not
-/// cancel the turn and is captured on its own message via
-/// [`SyntheticReason::Interjection`] (and the `interjected` telemetry event).
-/// Automatic terminations (hook-denied, max-turns) are not user interrupts
-/// and never set this.
-///
-/// Serialized as a lowercase string. Unknown variants from future writers
-/// deserialize as [`PriorTurnInterrupt::Unknown`] for forward compatibility.
+/// How the user *fatally* interrupted (cancelled) the turn immediately preceding this *real* user message.
+/// Set only on genuine user messages (`synthetic_reason == Human`) that directly follow a cancelled turn.
+/// Automatic terminations (hook-denied, max-turns) are not user interrupts and never set this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PriorTurnInterrupt {
-    /// Previous turn was aborted mid-flight (ESC / Ctrl+C while streaming or
-    /// running tools).
+    /// Previous turn was aborted mid-flight (ESC / Ctrl+C while streaming or running tools).
     MidTurnAbort,
     /// User clicked "No" on a permission prompt, ending the previous turn.
     PermissionRejected,
@@ -242,13 +248,9 @@ pub enum PriorTurnInterrupt {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserItem {
     pub content: Vec<ContentPart>,
-    /// Set when this item was synthesized by the runtime rather than typed by
-    /// a real user.  `None` for all genuine user messages.
-    ///
-    /// Uses `skip_serializing_if` so old JSONL sessions that lack this field
-    /// deserialize correctly (`serde(default)` fills in `None`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub synthetic_reason: Option<SyntheticReason>,
+    /// `Human` is omitted on write and filled in when absent, so real user turns serialize as they did when this field was optional.
+    #[serde(default, skip_serializing_if = "SyntheticReason::is_human")]
+    pub synthetic_reason: SyntheticReason,
     /// Relocation generation for a working-directory switch reminder.
     /// Structural metadata keeps recovery dedup independent of reminder text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -596,13 +598,20 @@ impl From<ToolDefinition> for ToolSpec {
 ///
 /// `Length` can arrive far below any client budget (e.g. an engine-side
 /// window clamp after a runaway generation); callers that can use partial
-/// output opt into `CompletePartial`.
+/// text opt into `CompletePartial`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LengthPolicy {
     /// Fail the attempt with `MaxTokensTruncation` (legacy behavior).
-    #[default]
     Fail,
-    /// Complete with the partial response; empty-Length still fails.
+    /// Complete a response whose tool calls all carry complete arguments;
+    /// text-only and empty `Length` still fail. `Length` is usually context
+    /// exhaustion (output budget = window minus prompt), so retrying cannot
+    /// succeed — executing the calls advances the turn toward compaction.
+    /// The default: a caller that does not choose gets its tool calls run
+    /// and its text-only truncation failed.
+    #[default]
+    CompleteToolCalls,
+    /// Additionally complete with partial text; empty `Length` still fails.
     CompletePartial,
 }
 
@@ -611,8 +620,10 @@ pub enum LengthPolicy {
 pub enum LengthVerdict {
     /// The stop reason is not `Length`; the policy does not apply.
     Pass,
-    /// A `Length` stop delivered with its partial content.
+    /// A `Length` stop delivered with its partial text content.
     Salvage,
+    /// A `Length` stop delivered with its completed tool calls.
+    SalvageToolCalls,
     /// A `Length` stop the policy rejects (`MaxTokensTruncation`).
     Fail,
 }
@@ -623,19 +634,40 @@ impl LengthPolicy {
     /// wraps it with the error mapping and salvage breadcrumb so the actor
     /// path (`drive_l2`) and the direct-collect path can never diverge.
     ///
-    /// Two cases fail regardless of policy: empty Length (deterministic
-    /// under a fixed cap; the Empty resample family would retry-storm) and
-    /// Length carrying tool calls (the trailing call's arguments may be
-    /// truncated). Guarantees the invariant: a salvaged response has
-    /// visible content and no tool calls.
+    /// Tool calls salvage under every policy except `Fail`, but only with
+    /// complete arguments: the xAI server never emits a completed
+    /// `tool_calls` entry for a truncated call, and the JSON check guards
+    /// providers that close a block they cut mid-arguments. Empty Length
+    /// fails regardless of policy (deterministic under a fixed cap; the
+    /// Empty resample family would retry-storm). In practice the tool-call
+    /// arm guards the Messages backend only: ChatCompletions and Responses
+    /// rewrite Length-with-tools to `ToolCalls` at the stream layer, so
+    /// those never reach it.
     pub fn verdict(self, response: &ConversationResponse) -> LengthVerdict {
         if response.stop_reason != Some(StopReason::Length) {
             return LengthVerdict::Pass;
         }
-        if self == LengthPolicy::CompletePartial
-            && response.empty_reason().is_none()
-            && response.tool_calls().is_empty()
-        {
+        let tool_calls = response.tool_calls();
+        if !tool_calls.is_empty() {
+            // Empty arguments are the zero-arg call convention, not proof of
+            // truncation: a call cut before its first argument delta also
+            // collects as empty, but executing it as `{}` just bounces off
+            // tool-argument validation — cheaper than failing the turn.
+            let all_arguments_complete = tool_calls.iter().all(|tc| {
+                tc.arguments.trim().is_empty()
+                    || serde_json::from_str::<serde::de::IgnoredAny>(&tc.arguments).is_ok()
+            });
+            return match (self, all_arguments_complete) {
+                (LengthPolicy::Fail, _)
+                | (LengthPolicy::CompleteToolCalls | LengthPolicy::CompletePartial, false) => {
+                    LengthVerdict::Fail
+                }
+                (LengthPolicy::CompleteToolCalls | LengthPolicy::CompletePartial, true) => {
+                    LengthVerdict::SalvageToolCalls
+                }
+            };
+        }
+        if self == LengthPolicy::CompletePartial && response.empty_reason().is_none() {
             LengthVerdict::Salvage
         } else {
             LengthVerdict::Fail
@@ -668,12 +700,17 @@ pub struct ConversationRequest {
     pub x_grok_req_id: Option<String>,
     pub x_grok_session_id: Option<String>,
     pub x_grok_turn_idx: Option<String>,
+    /// Turn-level resubmit attempt (absent on first submissions); sent as `x-grok-transient-retry` so the proxy can count retry traffic.
+    pub x_grok_transient_retry: Option<String>,
     pub x_grok_agent_id: Option<String>,
     pub x_grok_deployment_id: Option<String>,
     pub x_grok_user_id: Option<String>,
     /// Optional opaque tracing context (e.g., where to persist the finalized request payload).
     /// Consumers downcast via `trace.as_ref().unwrap().as_any().downcast_ref::<T>()`.
     pub trace: Option<Box<dyn TraceContext>>,
+    /// Caller span's W3C `traceparent`; the sampler parents its streaming HTTP span under it.
+    /// Non-streaming calls ignore it.
+    pub traceparent: Option<String>,
     /// Reasoning effort level for reasoning models.
     pub reasoning_effort: Option<crate::ReasoningEffort>,
     /// JSON Schema for structured output (strict mode).
@@ -792,6 +829,23 @@ impl StopReason {
             StopReason::ToolCalls => "tool_calls",
             StopReason::ContentFilter => "content_filter",
         }
+    }
+
+    /// Alias of [`Self::as_str`] for call sites that treat this like `AsRef<str>`.
+    pub fn as_ref(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for StopReason {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<StopReason> for &'static str {
+    fn from(reason: StopReason) -> Self {
+        reason.as_str()
     }
 }
 
@@ -1030,6 +1084,7 @@ impl ConversationItem {
     pub fn system(content: impl Into<String>) -> Self {
         Self::System(SystemItem {
             content: Arc::<str>::from(content.into()),
+            synthetic_reason: SyntheticReason::Primary,
         })
     }
 
@@ -1043,7 +1098,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
-            synthetic_reason: None,
+            synthetic_reason: SyntheticReason::Human,
             cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
@@ -1056,7 +1111,7 @@ impl ConversationItem {
     pub fn user_with_parts(parts: Vec<ContentPart>) -> Self {
         Self::User(UserItem {
             content: parts,
-            synthetic_reason: None,
+            synthetic_reason: SyntheticReason::Human,
             cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
@@ -1073,7 +1128,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
-            synthetic_reason: Some(SyntheticReason::CompactionMeta),
+            synthetic_reason: SyntheticReason::CompactionMeta,
             cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
@@ -1091,7 +1146,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
-            synthetic_reason: Some(SyntheticReason::SystemReminder),
+            synthetic_reason: SyntheticReason::SystemReminder,
             cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
@@ -1102,8 +1157,8 @@ impl ConversationItem {
     pub fn working_directory_switch_generation(&self) -> Option<u64> {
         match self {
             Self::User(user)
-                if user.synthetic_reason.as_ref()
-                    == Some(&SyntheticReason::WorkingDirectorySwitch) =>
+                if user.synthetic_reason
+                    == SyntheticReason::WorkingDirectorySwitch =>
             {
                 user.cwd_generation
             }
@@ -1111,7 +1166,20 @@ impl ConversationItem {
         }
     }
 
-    /// User message containing project instructions (AGENTS.md / CLAUDE.md),
+    /// The synthetic continue reminder after a salvaged Length truncation.
+    pub fn length_continue_reminder(content: impl Into<String>) -> Self {
+        Self::User(UserItem {
+            content: vec![ContentPart::Text {
+                text: Arc::<str>::from(content.into()),
+            }],
+            synthetic_reason: SyntheticReason::LengthContinue,
+            cwd_generation: None,
+            prior_turn_interrupt: None,
+            prompt_index: None,
+        })
+    }
+
+    /// User message tagged [`SyntheticReason::ProjectInstructions`],
     /// tagged [`SyntheticReason::ProjectInstructions`] for spawn-time
     /// idempotence. Once in the conversation, MUST NOT be replaced or
     /// re-inserted — see the variant docstring.
@@ -1120,7 +1188,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
-            synthetic_reason: Some(SyntheticReason::ProjectInstructions),
+            synthetic_reason: SyntheticReason::ProjectInstructions,
             cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
@@ -1133,7 +1201,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
-            synthetic_reason: Some(SyntheticReason::WorkingDirectorySwitch),
+            synthetic_reason: SyntheticReason::WorkingDirectorySwitch,
             cwd_generation: Some(cwd_generation),
             prior_turn_interrupt: None,
             prompt_index: None,
@@ -1146,7 +1214,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
-            synthetic_reason: Some(SyntheticReason::AgentMessage),
+            synthetic_reason: SyntheticReason::AgentMessage,
             cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
@@ -1163,7 +1231,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
-            synthetic_reason: Some(SyntheticReason::AutoContinue),
+            synthetic_reason: SyntheticReason::AutoContinue,
             cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
@@ -1180,7 +1248,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
-            synthetic_reason: Some(SyntheticReason::AutoRecovery),
+            synthetic_reason: SyntheticReason::AutoRecovery,
             cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
@@ -1198,7 +1266,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
-            synthetic_reason: Some(SyntheticReason::Interjection),
+            synthetic_reason: SyntheticReason::Interjection,
             cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
@@ -1211,7 +1279,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
-            synthetic_reason: Some(SyntheticReason::TaskCompleted),
+            synthetic_reason: SyntheticReason::TaskCompleted,
             cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
@@ -1224,7 +1292,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
-            synthetic_reason: Some(SyntheticReason::SubagentCompleted),
+            synthetic_reason: SyntheticReason::SubagentCompleted,
             cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
@@ -1237,7 +1305,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
-            synthetic_reason: Some(SyntheticReason::NotificationDrain),
+            synthetic_reason: SyntheticReason::NotificationDrain,
             cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
@@ -1250,7 +1318,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
-            synthetic_reason: Some(SyntheticReason::GoalSummary),
+            synthetic_reason: SyntheticReason::GoalSummary,
             cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
@@ -1267,7 +1335,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
-            synthetic_reason: Some(SyntheticReason::GoalClassifierNudge),
+            synthetic_reason: SyntheticReason::GoalClassifierNudge,
             cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
@@ -1280,7 +1348,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
-            synthetic_reason: Some(SyntheticReason::SchedulerFired),
+            synthetic_reason: SyntheticReason::SchedulerFired,
             cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
@@ -1293,7 +1361,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
-            synthetic_reason: Some(SyntheticReason::StopHookFeedback),
+            synthetic_reason: SyntheticReason::StopHookFeedback,
             cwd_generation: None,
             prior_turn_interrupt: None,
             prompt_index: None,
@@ -1934,13 +2002,13 @@ fn conversation_truncate_legacy(
         };
 
         let effective_index = match &user.synthetic_reason {
-            None if !seen_unmarked_preamble => {
+            SyntheticReason::Human if !seen_unmarked_preamble => {
                 seen_unmarked_preamble = true;
                 None
             }
-            None => Some(next_unmarked_index),
-            Some(reason) if reason.starts_prompt_turn() => Some(next_unmarked_index),
-            Some(_) => None,
+            SyntheticReason::Human => Some(next_unmarked_index),
+            reason if reason.starts_prompt_turn() => Some(next_unmarked_index),
+            _ => None,
         };
 
         if let Some(idx) = effective_index {
@@ -1967,12 +2035,12 @@ fn count_legacy_turns_until_marker(conversation: &[ConversationItem]) -> usize {
             break;
         }
         match &user.synthetic_reason {
-            None if !seen_unmarked_preamble => {
+            SyntheticReason::Human if !seen_unmarked_preamble => {
                 seen_unmarked_preamble = true;
             }
-            None => turns += 1,
-            Some(reason) if reason.starts_prompt_turn() => turns += 1,
-            Some(_) => {}
+            SyntheticReason::Human => turns += 1,
+            reason if reason.starts_prompt_turn() => turns += 1,
+            _ => {}
         }
     }
     turns
@@ -1998,13 +2066,13 @@ fn conversation_truncate_progressive(
             None
         } else {
             match &user.synthetic_reason {
-                None if !seen_unmarked_preamble => {
+                SyntheticReason::Human if !seen_unmarked_preamble => {
                     seen_unmarked_preamble = true;
                     None
                 }
-                None => Some(next_unmarked_index),
-                Some(reason) if reason.starts_prompt_turn() => Some(next_unmarked_index),
-                Some(_) => None,
+                SyntheticReason::Human => Some(next_unmarked_index),
+                reason if reason.starts_prompt_turn() => Some(next_unmarked_index),
+                _ => None,
             }
         };
 
@@ -2148,6 +2216,17 @@ pub fn repair_dangling_tool_calls(
     conversation: &mut Vec<ConversationItem>,
     reason: DanglingToolCallReason,
 ) -> usize {
+    repair_dangling_tool_calls_with(conversation, |_, name| {
+        synthetic_dangling_result_text(name, reason)
+    })
+}
+
+/// Like [`repair_dangling_tool_calls`], but lets the caller supply each synthetic result body.
+/// `answers`-style overrides and custom wording use this entry point.
+pub fn repair_dangling_tool_calls_with(
+    conversation: &mut Vec<ConversationItem>,
+    mut result_text: impl FnMut(&str, &str) -> String,
+) -> usize {
     // Phase 1: forward scan to find every assistant with unanswered tool calls.
     // We record (insert_position, synthetic_items) for each repair site.
     let mut repairs: Vec<(usize, Vec<ConversationItem>)> = Vec::new();
@@ -2183,7 +2262,7 @@ pub fn repair_dangling_tool_calls(
                 .map(|(id, name)| {
                     ConversationItem::tool_result(
                         id.as_ref(),
-                        synthetic_dangling_result_text(name, reason),
+                        result_text(id.as_ref(), name),
                     )
                 })
                 .collect();
@@ -2245,7 +2324,7 @@ pub fn has_dangling_tool_calls(conversation: &[ConversationItem]) -> bool {
     false
 }
 
-fn synthetic_dangling_result_text(name: &str, reason: DanglingToolCallReason) -> String {
+pub fn synthetic_dangling_result_text(name: &str, reason: DanglingToolCallReason) -> String {
     // Exhaustive match — no `_ =>` guard — so adding a new variant is a
     // compile-time error at every call site that renders these messages.
     match reason {
@@ -2432,14 +2511,14 @@ mod compaction_item_bridge_tests {
         assert_matches_user_reason(&plain, None);
 
         let meta = <ConversationItem as CompactionItemFactory>::new_user_meta("m".into());
-        assert_matches_user_reason(&meta, Some(SyntheticReason::CompactionMeta));
+        assert_matches_user_reason(&meta, SyntheticReason::CompactionMeta);
 
         let proj =
             <ConversationItem as CompactionItemFactory>::new_project_instructions("p".into());
-        assert_matches_user_reason(&proj, Some(SyntheticReason::ProjectInstructions));
+        assert_matches_user_reason(&proj, SyntheticReason::ProjectInstructions);
 
         let reminder = <ConversationItem as CompactionItemFactory>::new_system_reminder("r".into());
-        assert_matches_user_reason(&reminder, Some(SyntheticReason::SystemReminder));
+        assert_matches_user_reason(&reminder, SyntheticReason::SystemReminder);
     }
 
     fn assert_matches_user_reason(item: &ConversationItem, expected: Option<SyntheticReason>) {
@@ -4820,7 +4899,7 @@ mod tests {
         let item = ConversationItem::user("hello");
         if let ConversationItem::User(u) = item {
             assert!(
-                u.synthetic_reason.is_none(),
+                u.synthetic_reason.is_human(),
                 "real user messages must not have a synthetic_reason"
             );
         } else {
@@ -4838,7 +4917,7 @@ mod tests {
         });
         let item: ConversationItem = serde_json::from_value(json).expect("deserialize");
         if let ConversationItem::User(u) = item {
-            assert_eq!(u.synthetic_reason, Some(SyntheticReason::Unknown));
+            assert_eq!(u.synthetic_reason, SyntheticReason::Unknown);
         } else {
             panic!("expected User variant");
         }
@@ -4883,7 +4962,7 @@ mod tests {
         );
         let back: ConversationItem = serde_json::from_value(json).expect("deserialize");
         if let ConversationItem::User(u) = back {
-            assert_eq!(u.synthetic_reason, Some(SyntheticReason::SystemReminder));
+            assert_eq!(u.synthetic_reason, SyntheticReason::SystemReminder);
         } else {
             panic!("expected User variant after round-trip");
         }
@@ -4896,7 +4975,7 @@ mod tests {
         let old: ConversationItem = serde_json::from_value(old_json).expect("deserialize old");
         if let ConversationItem::User(u) = old {
             assert!(
-                u.synthetic_reason.is_none(),
+                u.synthetic_reason.is_human(),
                 "old sessions without synthetic_reason must deserialize as None"
             );
         } else {
@@ -4924,7 +5003,7 @@ mod tests {
     fn user_meta_tagged_correctly() {
         let item = ConversationItem::user_meta("file contents here");
         if let ConversationItem::User(u) = item {
-            assert_eq!(u.synthetic_reason, Some(SyntheticReason::CompactionMeta));
+            assert_eq!(u.synthetic_reason, SyntheticReason::CompactionMeta);
         } else {
             panic!("expected User variant");
         }
@@ -4947,7 +5026,7 @@ mod tests {
         );
         let back: ConversationItem = serde_json::from_value(json).expect("deserialize");
         if let ConversationItem::User(u) = back {
-            assert_eq!(u.synthetic_reason, Some(SyntheticReason::CompactionMeta));
+            assert_eq!(u.synthetic_reason, SyntheticReason::CompactionMeta);
         } else {
             panic!("expected User variant after round-trip");
         }
@@ -4957,7 +5036,7 @@ mod tests {
     fn system_reminder_tagged_correctly() {
         let item = ConversationItem::system_reminder("<system-reminder>test</system-reminder>");
         if let ConversationItem::User(u) = item {
-            assert_eq!(u.synthetic_reason, Some(SyntheticReason::SystemReminder));
+            assert_eq!(u.synthetic_reason, SyntheticReason::SystemReminder);
         } else {
             panic!("expected User variant");
         }
@@ -4973,7 +5052,7 @@ mod tests {
         );
         let back: ConversationItem = serde_json::from_value(json).expect("deserialize");
         if let ConversationItem::User(u) = back {
-            assert_eq!(u.synthetic_reason, Some(SyntheticReason::SystemReminder));
+            assert_eq!(u.synthetic_reason, SyntheticReason::SystemReminder);
         } else {
             panic!("expected User variant after round-trip");
         }
@@ -4983,7 +5062,7 @@ mod tests {
     fn auto_continue_tagged_correctly() {
         let item = ConversationItem::auto_continue("keep going");
         if let ConversationItem::User(u) = item {
-            assert_eq!(u.synthetic_reason, Some(SyntheticReason::AutoContinue));
+            assert_eq!(u.synthetic_reason, SyntheticReason::AutoContinue);
         } else {
             panic!("expected User variant");
         }
@@ -4996,7 +5075,7 @@ mod tests {
         assert_eq!(json["synthetic_reason"], serde_json::json!("auto_continue"));
         let back: ConversationItem = serde_json::from_value(json).expect("deserialize");
         if let ConversationItem::User(u) = back {
-            assert_eq!(u.synthetic_reason, Some(SyntheticReason::AutoContinue));
+            assert_eq!(u.synthetic_reason, SyntheticReason::AutoContinue);
         } else {
             panic!("expected User variant after round-trip");
         }
@@ -5006,7 +5085,7 @@ mod tests {
     fn auto_recovery_tagged_correctly() {
         let item = ConversationItem::auto_recovery("try again");
         if let ConversationItem::User(u) = item {
-            assert_eq!(u.synthetic_reason, Some(SyntheticReason::AutoRecovery));
+            assert_eq!(u.synthetic_reason, SyntheticReason::AutoRecovery);
         } else {
             panic!("expected User variant");
         }
@@ -5019,7 +5098,7 @@ mod tests {
         assert_eq!(json["synthetic_reason"], serde_json::json!("auto_recovery"));
         let back: ConversationItem = serde_json::from_value(json).expect("deserialize");
         if let ConversationItem::User(u) = back {
-            assert_eq!(u.synthetic_reason, Some(SyntheticReason::AutoRecovery));
+            assert_eq!(u.synthetic_reason, SyntheticReason::AutoRecovery);
         } else {
             panic!("expected User variant after round-trip");
         }
@@ -5033,7 +5112,7 @@ mod tests {
         if let ConversationItem::User(u) = item {
             assert_eq!(
                 u.synthetic_reason,
-                Some(SyntheticReason::ProjectInstructions),
+                SyntheticReason::ProjectInstructions,
                 "project_instructions must carry SyntheticReason::ProjectInstructions"
             );
             match u.content.as_slice() {
@@ -5075,7 +5154,7 @@ mod tests {
         if let ConversationItem::User(u) = back {
             assert_eq!(
                 u.synthetic_reason,
-                Some(SyntheticReason::ProjectInstructions)
+                SyntheticReason::ProjectInstructions
             );
         } else {
             panic!("expected User variant after round-trip");
@@ -5091,7 +5170,7 @@ mod tests {
         assert!(matches!(
             back,
             ConversationItem::User(UserItem {
-                synthetic_reason: Some(SyntheticReason::AgentMessage),
+                synthetic_reason: SyntheticReason::AgentMessage,
                 ..
             })
         ));
@@ -5109,7 +5188,7 @@ mod tests {
         assert!(matches!(
             item,
             ConversationItem::User(UserItem {
-                synthetic_reason: Some(SyntheticReason::AgentMessage),
+                synthetic_reason: SyntheticReason::AgentMessage,
                 ..
             })
         ));
@@ -5117,7 +5196,7 @@ mod tests {
 
     /// Forward-compat regression guard for the `#[serde(other)]` arm:
     /// payloads from newer clients with an unknown `synthetic_reason` value
-    /// must deserialize as `Some(SyntheticReason::Unknown)` rather than
+    /// must deserialize as `SyntheticReason::Unknown` rather than
     /// failing.
     #[test]
     fn unknown_synthetic_reason_deserializes_for_forward_compat() {
@@ -5129,7 +5208,7 @@ mod tests {
         let item: ConversationItem =
             serde_json::from_value(payload).expect("deserialize forward-compat payload");
         if let ConversationItem::User(u) = item {
-            assert_eq!(u.synthetic_reason, Some(SyntheticReason::Unknown));
+            assert_eq!(u.synthetic_reason, SyntheticReason::Unknown);
             assert!(u.synthetic_reason.as_ref().unwrap().starts_prompt_turn());
         } else {
             panic!("expected User variant");
@@ -5182,16 +5261,66 @@ mod tests {
             r.stop_reason = Some(StopReason::Length);
             r
         };
+        let call = |arguments: &str| ToolCall {
+            id: "tc1".into(),
+            name: "do_thing".into(),
+            arguments: arguments.into(),
+        };
         let text = length(ConversationItem::assistant("partial"));
         let empty = length(ConversationItem::assistant(""));
-        let tool_calls = length(ConversationItem::assistant_tool_calls(vec![ToolCall {
-            id: "call_cut".into(),
-            name: "do_thing".into(),
-            arguments: "{\"x\": \"trunc".into(),
-        }]));
+        let complete_tools = length(ConversationItem::assistant_tool_calls(vec![call(
+            "{\"x\": 1}",
+        )]));
+        // Zero-arg calls stream empty arguments; downstream normalizes to `{}`.
+        let empty_args_tools = length(ConversationItem::assistant_tool_calls(vec![call("")]));
+        let truncated_tools = length(ConversationItem::assistant_tool_calls(vec![call(
+            "{\"x\": \"trunc",
+        )]));
+        // One truncated call poisons the batch even when siblings are complete.
+        let mixed_tools = length(ConversationItem::assistant_tool_calls(vec![
+            call("{\"x\": 1}"),
+            call("{\"x\": \"trunc"),
+        ]));
         let stop = make_response(ConversationItem::assistant("done"));
 
+        assert_eq!(LengthPolicy::default(), LengthPolicy::CompleteToolCalls);
+
         assert_eq!(LengthPolicy::Fail.verdict(&text), LengthVerdict::Fail);
+        assert_eq!(
+            LengthPolicy::Fail.verdict(&complete_tools),
+            LengthVerdict::Fail
+        );
+        assert_eq!(LengthPolicy::Fail.verdict(&stop), LengthVerdict::Pass);
+
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&complete_tools),
+            LengthVerdict::SalvageToolCalls
+        );
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&empty_args_tools),
+            LengthVerdict::SalvageToolCalls
+        );
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&truncated_tools),
+            LengthVerdict::Fail
+        );
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&mixed_tools),
+            LengthVerdict::Fail
+        );
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&text),
+            LengthVerdict::Fail
+        );
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&empty),
+            LengthVerdict::Fail
+        );
+        assert_eq!(
+            LengthPolicy::CompleteToolCalls.verdict(&stop),
+            LengthVerdict::Pass
+        );
+
         assert_eq!(
             LengthPolicy::CompletePartial.verdict(&text),
             LengthVerdict::Salvage
@@ -5201,10 +5330,13 @@ mod tests {
             LengthVerdict::Fail
         );
         assert_eq!(
-            LengthPolicy::CompletePartial.verdict(&tool_calls),
+            LengthPolicy::CompletePartial.verdict(&complete_tools),
+            LengthVerdict::SalvageToolCalls
+        );
+        assert_eq!(
+            LengthPolicy::CompletePartial.verdict(&truncated_tools),
             LengthVerdict::Fail
         );
-        assert_eq!(LengthPolicy::Fail.verdict(&stop), LengthVerdict::Pass);
         assert_eq!(
             LengthPolicy::CompletePartial.verdict(&stop),
             LengthVerdict::Pass

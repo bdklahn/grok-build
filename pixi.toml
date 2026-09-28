@@ -2,15 +2,24 @@
 authors = ["Brian D. Klahn <brian.klahn@klahnpages.net>"]
 channels = ["conda-forge"]
 name = "grok-build"
-platforms = ["linux-64"]
+platforms = ["linux-64","osx-arm64"]
 version = "0.1.0"
 
 [tasks]
 # Build the TUI and install it as `grok` into this env.
-install-grok = "cargo build --release -p xai-grok-pager-bin && install -D -m 755 target/release/xai-grok-pager \"$CONDA_PREFIX/bin/grok\" && ln -sfn grok \"$CONDA_PREFIX/bin/xai-grok-pager\""
+install-dotslash = "command -v dotslash >/dev/null || cargo install --root \"$CONDA_PREFIX\" dotslash"
+
+[tasks.install-grok]
+cmd = """
+test -f "$CONDA_PREFIX/bin/grok" ||
+cargo build --release -p xai-grok-pager-bin &&
+cp target/release/xai-grok-pager "$CONDA_PREFIX/bin/grok" &&
+ln -sfn xai-grok-pager "$CONDA_PREFIX/bin/grok"
+"""
+depends-on = ["install-dotslash"]
 
 [dependencies]
-rust = "1.94.*"
+rust = "==1.94.0"
 pkg-config = ">=0.29.2,<0.30"
 protobuf = ">=7.35.1,<8"
 sysroot_linux-64 = ">=2.38"

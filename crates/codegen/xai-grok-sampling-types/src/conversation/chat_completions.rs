@@ -7,6 +7,7 @@ impl From<ChatRequestMessage> for ConversationItem {
         match msg.role {
             Role::System => ConversationItem::System(SystemItem {
                 content: Arc::<str>::from(msg.text_content()),
+                synthetic_reason: SyntheticReason::Primary,
             }),
             Role::User => {
                 let parts = msg
@@ -24,7 +25,7 @@ impl From<ChatRequestMessage> for ConversationItem {
                     .collect();
                 ConversationItem::User(UserItem {
                     content: parts,
-                    synthetic_reason: None,
+                    synthetic_reason: SyntheticReason::Human,
                     ..Default::default()
                 })
             }
@@ -192,7 +193,7 @@ pub fn conversation_to_chat_messages(items: Vec<ConversationItem>) -> Vec<ChatRe
             content,
             // Not a user prompt: recaps, turn summaries, and prompt suggest
             // filter `synthetic_reason.is_some()` out of "real" queries.
-            synthetic_reason: Some(SyntheticReason::SystemReminder),
+            synthetic_reason: SyntheticReason::SystemReminder,
             ..Default::default()
         })));
     }
@@ -328,10 +329,12 @@ impl From<ConversationRequest> for ChatCompletionRequest {
             x_grok_req_id: req.x_grok_req_id,
             x_grok_session_id: req.x_grok_session_id,
             x_grok_turn_idx: req.x_grok_turn_idx,
+            x_grok_transient_retry: req.x_grok_transient_retry,
             x_grok_agent_id: req.x_grok_agent_id,
             x_grok_deployment_id: req.x_grok_deployment_id,
             x_grok_user_id: req.x_grok_user_id,
             trace: None,
+            traceparent: req.traceparent,
         }
     }
 }

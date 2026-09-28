@@ -856,7 +856,7 @@ fn build_empty_context(
         None => (0, 0, String::new(), false),
     };
 
-    let finish_reason = response.stop_reason.map(|sr| sr.as_ref().to_owned());
+    let finish_reason = response.stop_reason.map(|sr| sr.as_str().to_owned());
     let (completion_tokens, reasoning_tokens, prompt_tokens) = response
         .usage
         .as_ref()
